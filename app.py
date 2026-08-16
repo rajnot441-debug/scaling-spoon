@@ -220,5 +220,19 @@ try:
 
         st.plotly_chart(fig, use_container_width=True, config=chart_config)
 
+
+        
+
+try:
+    raw_df, source = fetch_live_ohlcv(pair, timeframe)
+    
+    if raw_df is None or raw_df.empty:
+        st.warning("⚠️ மார்க்கெட் டேட்டா கிடைப்பதில் சிறு தாமதம்... அடுத்த விநாடியில் சரியாகிவிடும்.")
+        st.stop()
+        
+    df = compute_all_indicators(raw_df)
+    signal, confidence, last = generate_signals(df)
+    
 except Exception as e:
     st.error(f"Live Terminal Error: {e}")
+    
