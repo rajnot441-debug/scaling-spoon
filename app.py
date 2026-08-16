@@ -16,6 +16,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -49,7 +50,29 @@ FREE_PAIRS = ["BTC/USDT", "ETH/USDT"]  # Free tier is limited
 TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"]
 FREE_TIMEFRAMES = ["1h", "4h", "1d"]  # Free tier can't access lower timeframes
 
-EXCHANGE_ID = "binance"
+EXCHANGE_ID = "binance"  # kept as the first CCXT exchange tried, see CCXT_EXCHANGES_TO_TRY
+
+# Multiple exchanges are tried in order because some cloud hosts (e.g.
+# Streamlit Community Cloud) run from IP ranges that certain exchanges
+# geo-block (Binance is a common one). If every exchange fails, the app
+# falls back to the CoinGecko public API further below.
+CCXT_EXCHANGES_TO_TRY = ["binance", "kucoin", "bybit", "okx", "gateio", "kraken"]
+
+# CoinGecko fallback: map our "BASE/QUOTE" pairs to CoinGecko coin IDs.
+# CoinGecko's free market_chart endpoint only prices against fiat/major
+# currencies (we use USD as a stand-in for USDT, which is a very close peg).
+COINGECKO_ID_MAP = {
+    "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "BNB": "binancecoin",
+    "XRP": "ripple", "ADA": "cardano", "DOGE": "dogecoin", "AVAX": "avalanche-2",
+    "LINK": "chainlink", "MATIC": "matic-network",
+}
+
+# How many days of history to request from CoinGecko for each timeframe,
+# and the pandas resample rule used to bucket the raw price/volume series
+# into OHLCV candles. CoinGecko auto-selects raw granularity by day range:
+# <=1 day -> ~5min data, 2-90 days -> hourly data, >90 days -> daily data.
+TF_TO_CG_DAYS = {"5m": 1, "15m": 1, "1h": 30, "4h": 90, "1d": 365}
+TF_TO_RESAMPLE_RULE = {"5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1D"}
 
 # Demo credentials for the login simulation (NOT real auth — see disclaimer)
 DEMO_USERS = {
@@ -206,20 +229,103 @@ def login_screen():
 
 
 # =============================================================================
-# DATA FETCHING (CCXT)
+# DATA FETCHING — multi-exchange CCXT with CoinGecko public-API fallback
 # =============================================================================
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_ohlcv(pair: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
-    if ccxt is None:
-        raise RuntimeError("ccxt is not installed. Run: pip install ccxt")
-
-    exchange_class = getattr(ccxt, EXCHANGE_ID)
-    exchange = exchange_class({"enableRateLimit": True})
+def _fetch_ohlcv_ccxt(pair: str, timeframe: str, limit: int, exchange_id: str) -> pd.DataFrame:
+    exchange_class = getattr(ccxt, exchange_id)
+    exchange = exchange_class({"enableRateLimit": True, "timeout": 8000})
     raw = exchange.fetch_ohlcv(pair, timeframe=timeframe, limit=limit)
+    if not raw:
+        raise ValueError("empty OHLCV response")
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("timestamp", inplace=True)
     return df
+
+
+def _fetch_ohlcv_coingecko(pair: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """
+    Fallback data source using CoinGecko's free /market_chart endpoint
+    (no API key required, generally reachable from cloud hosts that
+    exchanges like Binance geo-block).
+
+    Note: CoinGecko's public endpoint returns a price time series and a
+    rolling total-volume series rather than true per-candle OHLCV, so we
+    reconstruct approximate OHLC via resample().ohlc() on price, and use
+    the mean of the rolling volume series per bucket as an approximate
+    volume proxy. This is clearly labeled in the UI as approximate.
+    """
+    base = pair.split("/")[0].upper()
+    coin_id = COINGECKO_ID_MAP.get(base)
+    if not coin_id:
+        raise ValueError(f"No CoinGecko mapping for base asset '{base}'")
+
+    days = TF_TO_CG_DAYS.get(timeframe, 30)
+    rule = TF_TO_RESAMPLE_RULE.get(timeframe, "1h")
+
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    resp = requests.get(
+        url, params={"vs_currency": "usd", "days": days}, timeout=10
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+
+    prices = payload.get("prices", [])
+    volumes = payload.get("total_volumes", [])
+    if not prices:
+        raise ValueError("CoinGecko returned no price data")
+
+    price_df = pd.DataFrame(prices, columns=["ts", "price"])
+    price_df["ts"] = pd.to_datetime(price_df["ts"], unit="ms")
+    price_df.set_index("ts", inplace=True)
+
+    vol_df = pd.DataFrame(volumes, columns=["ts", "volume"])
+    vol_df["ts"] = pd.to_datetime(vol_df["ts"], unit="ms")
+    vol_df.set_index("ts", inplace=True)
+
+    ohlc = price_df["price"].resample(rule).ohlc()
+    vol = vol_df["volume"].resample(rule).mean()
+
+    df = ohlc.join(vol, how="left")
+    df["volume"] = df["volume"].fillna(method="ffill")
+    df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+
+    if df.empty:
+        raise ValueError("Resampled CoinGecko data is empty")
+
+    return df.tail(limit)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ohlcv(pair: str, timeframe: str, limit: int = 300):
+    """
+    Returns (df, source_label). Tries several CCXT exchanges in order (to
+    route around per-exchange geo-blocking on cloud hosts), then falls back
+    to the CoinGecko public API if every exchange attempt fails. Raises only
+    if every provider fails, with all provider errors collected for display.
+    """
+    errors = []
+
+    if ccxt is not None:
+        for exchange_id in CCXT_EXCHANGES_TO_TRY:
+            try:
+                df = _fetch_ohlcv_ccxt(pair, timeframe, limit, exchange_id)
+                return df, f"{exchange_id} (via CCXT)"
+            except Exception as e:
+                errors.append(f"{exchange_id}: {e}")
+                continue
+    else:
+        errors.append("ccxt not installed")
+
+    try:
+        df = _fetch_ohlcv_coingecko(pair, timeframe, limit)
+        return df, "CoinGecko (public API fallback — approximate volume)"
+    except Exception as e:
+        errors.append(f"coingecko: {e}")
+
+    raise RuntimeError(
+        "All data providers failed:\n- " + "\n- ".join(errors)
+    )
 
 
 # =============================================================================
@@ -488,7 +594,10 @@ def main_app():
         st.sidebar.success("✅ Premium Pro active")
 
     st.sidebar.divider()
-    st.sidebar.caption(f"Data source: {EXCHANGE_ID} via CCXT · Last refresh cached 60s")
+    st.sidebar.caption(
+        "Data source: tries " + ", ".join(CCXT_EXCHANGES_TO_TRY) +
+        " (via CCXT), then falls back to CoinGecko · cached 60s"
+    )
     refresh = st.sidebar.button("🔄 Refresh Data", use_container_width=True)
     if refresh:
         fetch_ohlcv.clear()
@@ -498,19 +607,41 @@ def main_app():
             render_upgrade_modal()
         st.divider()
 
-    # ---- Fetch + compute ----
+    # ---- Fetch + compute (multi-exchange CCXT, falls back to CoinGecko) ----
     try:
-        with st.spinner(f"Fetching live {pair} {timeframe} data from {EXCHANGE_ID}..."):
-            raw_df = fetch_ohlcv(pair, timeframe)
+        with st.spinner(f"Fetching live {pair} {timeframe} data..."):
+            raw_df, data_source = fetch_ohlcv(pair, timeframe)
         df = compute_indicators(raw_df)
     except Exception as e:
-        st.error(f"⚠️ Failed to fetch live data: {e}")
-        st.info(
-            "If you're running locally without exchange access (e.g. geo-blocked or "
-            "no internet in this sandbox), install `ccxt` and ensure outbound network "
-            "access is permitted, or swap `EXCHANGE_ID` for an accessible exchange."
+        st.markdown(
+            f"""
+            <div class='disclaimer-box' style='border-left-color:#e74c3c;'>
+            ⚠️ <b>Unable to load market data right now.</b><br/>
+            Every configured data provider failed for <b>{pair} / {timeframe}</b>
+            (exchanges are commonly geo-blocked on cloud hosts, and public APIs
+            occasionally rate-limit). Details:<br/>
+            <pre style='white-space:pre-wrap;font-size:11px;color:#999;'>{e}</pre>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("🔄 Retry now", use_container_width=True):
+                fetch_ohlcv.clear()
+                st.rerun()
+        with col_b:
+            st.caption("Tip: try a different pair/timeframe, or wait a minute for rate limits to reset.")
         st.stop()
+
+    if "CoinGecko" in data_source:
+        st.info(
+            "ℹ️ Live exchange data was unavailable (likely geo-blocked on this host), so this "
+            "chart is running on the **CoinGecko fallback**. OHLC is reconstructed from CoinGecko's "
+            "price series and volume is an approximate rolling-average proxy, not exact per-candle "
+            "volume — treat volume-based readings with extra caution.",
+            icon="ℹ️",
+        )
 
     result = generate_signal(df)
 
@@ -592,7 +723,7 @@ def main_app():
         """,
         unsafe_allow_html=True,
     )
-    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · Data via {EXCHANGE_ID} (CCXT)")
+    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · Data via {data_source}")
 
 
 # =============================================================================
